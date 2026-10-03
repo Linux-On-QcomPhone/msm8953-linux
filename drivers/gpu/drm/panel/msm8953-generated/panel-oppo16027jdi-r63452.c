@@ -3,6 +3,7 @@
 // Generated with linux-mdss-dsi-panel-driver-generator from vendor device tree:
 //   Copyright (c) 2013, The Linux Foundation. All rights reserved. (FIXME)
 
+#include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/mod_devicetable.h>
@@ -21,6 +22,7 @@ struct oppo16027jdi_r63452 {
 	struct mipi_dsi_device *dsi;
 	struct regulator_bulk_data *supplies;
 	struct gpio_desc *reset_gpio;
+	struct backlight_device *bl;
 };
 
 static const struct regulator_bulk_data oppo16027jdi_r63452_supplies[] = {
@@ -54,7 +56,14 @@ static int oppo16027jdi_r63452_on(struct oppo16027jdi_r63452 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xe9, 0x40, 0x00, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd6, 0x01);
-	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 0x00ff);
+	/*
+	 * This panel expects DCS 0x51 (set display brightness) with a single
+	 * parameter (0..255). Sending the generic two-byte form leaves the
+	 * panel at the wrong brightness and makes dimming impossible.
+	 */
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx,
+					 MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
+					 ctx->bl ? ctx->bl->props.brightness : 0xff);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
 				     0x24);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x02);
@@ -151,10 +160,84 @@ static int oppo16027jdi_r63452_get_modes(struct drm_panel *panel,
 	return drm_connector_helper_get_modes_fixed(connector, &oppo16027jdi_r63452_mode);
 }
 
+
+#define OPPO16027JDI_R63452_MAX_BRIGHTNESS	255
+
+static int oppo16027jdi_r63452_bl_update_status(struct backlight_device *bl)
+{
+	struct oppo16027jdi_r63452 *ctx = bl_get_data(bl);
+	u8 brightness = backlight_get_brightness(bl);
+	int ret;
+
+	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+
+	/* DCS 0x51 takes exactly one parameter on this panel. */
+	ret = mipi_dsi_dcs_write(ctx->dsi, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
+				 &brightness, sizeof(brightness));
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static const struct backlight_ops oppo16027jdi_r63452_bl_ops = {
+	.update_status = oppo16027jdi_r63452_bl_update_status,
+};
+
 static const struct drm_panel_funcs oppo16027jdi_r63452_panel_funcs = {
 	.prepare = oppo16027jdi_r63452_prepare,
 	.unprepare = oppo16027jdi_r63452_unprepare,
 	.get_modes = oppo16027jdi_r63452_get_modes,
+};
+
+/*
+ * Debug helper: send a raw DCS command to the panel.
+ *   echo "51 0F"    > dcs_write   -> DCS 0x51 with payload 0x0F
+ *   echo "53 2C"    > dcs_write   -> DCS 0x53 with payload 0x2C
+ * Used to probe panel-internal brightness/dimming controls while porting.
+ */
+static ssize_t dcs_write_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct oppo16027jdi_r63452 *ctx = dev_get_drvdata(dev);
+	u8 cmd[32];
+	int n = 0;
+	const char *p = buf;
+
+	while (n < (int)sizeof(cmd)) {
+		unsigned int v;
+		char *end;
+
+		v = simple_strtoul(p, &end, 16);
+		if (end == p)
+			break;
+		cmd[n++] = v & 0xff;
+		p = end;
+		while (*p == ' ' || *p == '\t' || *p == ',')
+			p++;
+		if (*p == '\0' || *p == '\n')
+			break;
+	}
+
+	if (n < 1)
+		return -EINVAL;
+
+	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	mipi_dsi_dcs_write(ctx->dsi, cmd[0], &cmd[1], n - 1);
+	dev_info(dev, "dcs_write: cmd 0x%02x len %d applied\n", cmd[0], n - 1);
+
+	return count;
+}
+static DEVICE_ATTR_WO(dcs_write);
+
+static struct attribute *oppo16027jdi_r63452_attrs[] = {
+	&dev_attr_dcs_write.attr,
+	NULL,
+};
+
+static const struct attribute_group oppo16027jdi_r63452_attr_group = {
+	.attrs = oppo16027jdi_r63452_attrs,
 };
 
 static int oppo16027jdi_r63452_probe(struct mipi_dsi_device *dsi)
@@ -184,6 +267,10 @@ static int oppo16027jdi_r63452_probe(struct mipi_dsi_device *dsi)
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
 
+	ret = devm_device_add_group(dev, &oppo16027jdi_r63452_attr_group);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to add sysfs groups\n");
+
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST | MIPI_DSI_MODE_VIDEO_HSE |
@@ -191,9 +278,23 @@ static int oppo16027jdi_r63452_probe(struct mipi_dsi_device *dsi)
 
 	ctx->panel.prepare_prev_first = true;
 
-	ret = drm_panel_of_backlight(&ctx->panel);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to get backlight\n");
+	{
+		struct backlight_properties props = {
+			.type = BACKLIGHT_RAW,
+			.max_brightness = OPPO16027JDI_R63452_MAX_BRIGHTNESS,
+			.brightness = OPPO16027JDI_R63452_MAX_BRIGHTNESS,
+		};
+
+		ctx->bl = devm_backlight_device_register(dev, "backlight", dev,
+							 ctx,
+							 &oppo16027jdi_r63452_bl_ops,
+							 &props);
+		if (IS_ERR(ctx->bl))
+			return dev_err_probe(dev, PTR_ERR(ctx->bl),
+					     "Failed to register backlight\n");
+
+		ctx->panel.backlight = ctx->bl;
+	}
 
 	drm_panel_add(&ctx->panel);
 
